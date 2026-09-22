@@ -120,16 +120,21 @@ adb install -r deliverables/GuideSphere.apk
 
 ### 方式 B：从源码构建
 
-**环境**：JDK 17、Android SDK（`compileSdk 37`）。工程内**没有 `gradlew`**，
-请用本机 Gradle 9.6 或自己生成 wrapper。
+**环境**：JDK 17+、Android SDK（`compileSdk 37`，需装对应 platform 与 build-tools）。
+仓库自带 **Gradle Wrapper（9.6.0）**，不需要预装 Gradle。
 
 ```bash
 cd GuideSphere
 echo "sdk.dir=/path/to/Android/Sdk" > local.properties   # 指向你的 SDK
 
-gradle assembleRelease        # 产物：app/build/outputs/apk/release/app-release.apk
-gradle assembleDebug          # 或只出 debug 包
+./gradlew assembleRelease     # 产物：app/build/outputs/apk/release/app-release.apk
+./gradlew assembleDebug       # 或只出 debug 包
+
+./gradlew installRelease      # 装到已连接的设备
 ```
+
+> Windows 下用 `gradlew.bat`。首次运行 wrapper 会去 `services.gradle.org` 下载
+> Gradle 9.6.0 发行包（约 130 MB），之后走本地缓存。
 
 **关于签名**：仓库里**不放私钥**。不配置时 release 变体自动回退到 debug 签名，
 所以克隆下来就能直接构建出可安装的包。要出正经的签名包，在 `GuideSphere/` 下建
@@ -143,7 +148,7 @@ keyPassword=******
 ```
 
 **访问不了 google() / mavenCentral()？** 在 `GuideSphere/gradle.properties` 里
-取消注释那四行代理配置；依赖已经进过本地缓存后用 `gradle --offline` 可以完全跳过网络。
+取消注释那四行代理配置；依赖已经进过本地缓存后用 `./gradlew --offline` 可以完全跳过网络。
 
 **技术栈**：Kotlin 2.3（AGP 9.2.1 内置）+ Gradle 9.6 + AGP 9.2.1，
 minSdk 26 / targetSdk 37，OpenGL ES 3.0，CameraX 1.6.2。
@@ -232,6 +237,8 @@ AR_Ball/
 ├── docs/
 │   └── IMPLEMENTATION.md          ← 实现文档（架构 / 坐标系 / 算法 / 踩坑）
 ├── GuideSphere/                    Android 工程
+│   ├── gradlew / gradlew.bat        Gradle Wrapper（Gradle 9.6.0）
+│   ├── gradle/wrapper/              wrapper jar 与 properties
 │   ├── settings.gradle.kts
 │   ├── gradle.properties           代理配置（默认注释掉）
 │   ├── keystore.properties         ← 本机签名口令，已被 .gitignore 排除

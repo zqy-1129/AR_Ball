@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------- 换行符统一
+# 背景：本工程主要在 Windows 上开发，若依赖 core.autocrlf 自动转换，
+# gradlew 这类 shell 脚本会在 macOS / Linux 上被检出成 CRLF，
+# 直接报 `bad interpreter: /bin/sh^M`。所以这里显式钉死。
+#
+# 默认：仓库内存 LF，检出一律 LF（对 Unix 友好）。
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则 cmd 解析异常。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# ---------------------------------------------------------------- 二进制（禁止任何转换）
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.apk   binary
+*.aab   binary
+*.jar   binary
+*.mp4   binary
+*.jks   binary
+*.keystore binary
+*.zip   binary
