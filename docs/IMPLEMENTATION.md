@@ -97,7 +97,7 @@ app/src/main/java/com/remy/guidesphere/
                                      球体停靠面板、目标面方向箭头、完成横幅
 ```
 
-全部 Kotlin 源码约 3000 行，无第三方 UI 依赖。
+全部 Kotlin 源码 11 个文件共约 3600 行，无第三方 UI 依赖。
 
 ---
 
