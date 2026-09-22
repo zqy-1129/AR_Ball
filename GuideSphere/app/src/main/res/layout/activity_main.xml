@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <!-- 背景：相机实时画面 -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:implementationMode="compatible"
+        app:scaleType="fillCenter" />
+
+    <!-- 前景：引导球（透明叠加层，随设备旋转） -->
+    <com.remy.guidesphere.gl.GlSphereView
+        android:id="@+id/glSphereView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 最上层：HUD 与交互控件 -->
+    <com.remy.guidesphere.ui.HudView
+        android:id="@+id/hudView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+</FrameLayout>
