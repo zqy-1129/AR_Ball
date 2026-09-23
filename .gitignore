@@ -24,6 +24,9 @@ keystore.properties
 .workbuddy/
 _env.txt
 _ls.txt
+# 模拟器启动日志（排查启动失败时用，不入库）
+emu.log
+*.log
 
 # ---------------------------------------------------------------- 系统
 .DS_Store

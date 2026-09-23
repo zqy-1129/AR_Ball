@@ -332,7 +332,6 @@ class GuideSphereRenderer {
             stats.total = session.count
             stats.lit = session.litCount
             stats.coverage = session.coverage
-            stats.inFrameUnlit = session.inFrameUnlit
             stats.lastBatch = session.lastBatch
             stats.batchFlash = session.batchFlash
             // 球体在屏幕上的投影半径（像素），让 HUD 的进度环能严丝合缝地套在球外面
@@ -350,6 +349,15 @@ class GuideSphereRenderer {
             // 360° 方位扇区引导
             stats.doneCount = session.doneCount
             stats.camSector = session.camSector
+            stats.targetSector = session.targetSector
+            // 8 位掩码：第 s 位 = 第 s 个面已采集完成。HUD 的 8 段进度环据此逐段点亮，
+            // 比传一个 FloatArray 更省，也不会跨线程共享可变数组。
+            var mask = 0
+            for (s in 0 until ScanSession.SECTOR_COUNT) {
+                if (session.sectorComplete[s]) mask = mask or (1 shl s)
+            }
+            stats.sectorDoneMask = mask
+            stats.camFaceProgress = session.camFaceProgress
             stats.viewportWidth = w
             stats.viewportHeight = h
             onStats?.invoke(stats)
@@ -509,7 +517,6 @@ class GuideSphereRenderer {
         var total: Int = 0
         var lit: Int = 0
         var coverage: Float = 0f
-        var inFrameUnlit: Int = 0
         var lastBatch: Int = 0
         var batchFlash: Float = 0f
         var sphereRadiusPx: Float = 0f
@@ -529,6 +536,15 @@ class GuideSphereRenderer {
         var doneCount: Int = 0
         var camSector: Int = 0
 
+        /** 当前建议采集的目标面（固定顺时针推进） */
+        var targetSector: Int = 0
+
+        /** 已采集完成的面位掩码（第 s 位 = 第 s 个面），驱动 HUD 的 8 段进度环 */
+        var sectorDoneMask: Int = 0
+
+        /** 镜头正对的那个面「已对准多久」0..1，驱动 HUD 的对准进度小弧 */
+        var camFaceProgress: Float = 0f
+
         var viewportWidth: Int = 0
         var viewportHeight: Int = 0
 
@@ -539,7 +555,6 @@ class GuideSphereRenderer {
             total = other.total
             lit = other.lit
             coverage = other.coverage
-            inFrameUnlit = other.inFrameUnlit
             lastBatch = other.lastBatch
             batchFlash = other.batchFlash
             sphereRadiusPx = other.sphereRadiusPx
@@ -550,6 +565,9 @@ class GuideSphereRenderer {
             hasTarget = other.hasTarget
             doneCount = other.doneCount
             camSector = other.camSector
+            targetSector = other.targetSector
+            sectorDoneMask = other.sectorDoneMask
+            camFaceProgress = other.camFaceProgress
             viewportWidth = other.viewportWidth
             viewportHeight = other.viewportHeight
         }

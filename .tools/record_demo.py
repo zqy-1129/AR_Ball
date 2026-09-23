@@ -4,14 +4,18 @@
 一键录制引导球功能演示。
 
 流程：
-  1. 安装并启动 APK（自动授予相机权限）；
-  2. 用模拟器控制台注入「真实传感器数据」，驱动设备绕物体做 360° 环绕；
-  3. 环绕结束后从 logcat 读取**实际覆盖率**，若仍有漏拍角度，
+  1. 安装 APK（`pm clear` 清掉偏好设置，好让首次引导重新出现）并启动；
+  2. 录屏从**首次引导**开始：依次点过三页引导；
+  3. 用模拟器控制台注入「真实传感器数据」，驱动设备绕物体做 360° 环绕；
+  4. 环绕结束后从 logcat 读取**实际覆盖率**，若仍有漏拍角度，
      则按 App 的 168 点网格逐个精确瞄准补扫（闭环，直到 168/168）；
-  4. 全过程用设备端 screenrecord 录屏，最后拉回宿主机。
+  5. 全过程用设备端 screenrecord 录屏，最后拉回宿主机。
 
 前置：模拟器已启动（emulator-5554）、APK 已构建。
 用法：python record_demo.py <apk路径> <输出mp4路径>
+
+注意：`pm clear` 会同时清掉相机授权，因此授权必须放在 clear 之后，
+否则整段演示都会被"需要相机权限"遮罩盖住。
 """
 import os
 import re
@@ -34,6 +38,10 @@ STEP_DEG = 3.0
 RATE_HZ = 5.0
 
 LIT_RE = re.compile(r"lit=(\d+)/(\d+)")
+
+# 首次引导「点哪都翻页」，这两点是面板正中的空白区，不会误触任何控件。
+# 之后这个位置也是 HUD 的空区域，多点几下无副作用。
+ONBOARD_TAP_X, ONBOARD_TAP_Y = 360, 700
 
 # 与 App 内 SphereGeometry 的网格排布保持同步：8 扇区 × 3 方位列 × 7 仰角行 = 168
 SPHERE_DOTS = 8 * 3 * 7
@@ -86,7 +94,10 @@ def main():
     r = adb("install", "-r", "-g", apk)
     print((r.stdout or r.stderr).strip(), flush=True)
 
-    print("[2/6] 授权并启动 ...", flush=True)
+    print("[2/6] 清数据、授权并启动 ...", flush=True)
+    # 先 clear 再 grant：clear 会把运行时权限一并撤销，
+    # 顺序反了的话开机就是"需要相机权限"遮罩，整段演示全废。
+    sh("pm clear %s" % PKG)
     sh("pm grant %s android.permission.CAMERA" % PKG)
     sh("am force-stop %s" % PKG)
     adb("logcat", "-c")
@@ -104,7 +115,14 @@ def main():
          "--time-limit", "240", remote],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    time.sleep(3.0)  # 开场：静止展示引导球与相机画面
+    time.sleep(2.5)  # 开场：引导第 1 页
+
+    print("   走过首次引导的三页 ...", flush=True)
+    # 引导页「点哪都翻页」，第三页换成"开始扫描"；三下之后自动采集恢复
+    for i in range(3):
+        sh("input tap %d %d" % (ONBOARD_TAP_X, ONBOARD_TAP_Y))
+        time.sleep(2.0)
+    time.sleep(1.0)
 
     print("[4/6] 绕物体水平环绕一圈（%d 带 × %.0f°）..." % (len(ELEVATIONS), STEP_DEG), flush=True)
     interval = 1.0 / RATE_HZ

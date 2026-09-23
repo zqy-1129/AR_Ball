@@ -22,11 +22,17 @@ import kotlin.math.sqrt
  * 全部用 Canvas 直接绘制，不依赖任何 UI 框架：
  *  - 引导球缩小后停靠在画面下方，用一个圆角面板框起来，并标注「物体」——
  *    中间的整片区域留给真实相机画面，用户能看清自己正在拍什么；
- *  - 覆盖度进度环严丝合缝地套在球外侧（球心与半径由渲染线程实时回传）；
- *  - 四角取景框标示"哪些角度会被判定为已拍摄"，让判定逻辑对用户可见；
- *  - 环上的琥珀色箭头指出"手机该往哪边转"，对应球面上呼吸的目标光点；
+ *  - 覆盖度进度环做成 **8 段**，一段就是一个待采集的面，完成一段亮一段。
+ *    外圈还有一段更细的弧，表示「镜头正对的那个面已经对准多久」；
+ *  - 四角取景框标示拍摄范围，全部完成时转为青绿；
+ *  - 环上的琥珀色箭头 + 中央的方向文案（「向右转」/「抬高手机」）告诉用户手机该往哪边动；
  *  - 快门 / 自动采样切换 / 重置 / 自动巡航，都是自绘的可点击控件；
- *  - 覆盖完成时给出庆祝提示。
+ *  - 首次启动有一段三页的引导，点按推进、可跳过；
+ *  - 每次整面采集、以及全部完成时给出触觉反馈。
+ *
+ * 交互上有两处刻意的「慢一拍」设计：
+ *  - 「重置」需要连点两次确认（第一次变成「确认重置」），避免辛苦扫完一半被误触清空；
+ *  - 采集完成后的横幅本身可点，点它即重新开始。
  */
 class HudView @JvmOverloads constructor(
     context: Context,
@@ -51,6 +57,9 @@ class HudView @JvmOverloads constructor(
 
         /** 在非控件区域拖动 */
         fun onDrag(dx: Float, dy: Float)
+
+        /** 首次引导已看完（或跳过），可以正式开始扫描了 */
+        fun onOnboardingFinished()
     }
 
     var listener: Listener? = null
@@ -65,10 +74,11 @@ class HudView @JvmOverloads constructor(
             android.util.TypedValue.COMPLEX_UNIT_SP, 1f, resources.displayMetrics
         )
 
+    private val haptics = Haptics(context)
+
     private var coverageTarget = 0f
     private var coverageAnim = 0f
     private var lit = 0
-    private var inFrameUnlit = 0
     private var fps = 0
     private var drawMs = 0f
     private var sphereRadiusPx = 0f
@@ -77,13 +87,26 @@ class HudView @JvmOverloads constructor(
     private var sphereCenterXPx = 0f
     private var sphereCenterYPx = 0f
 
-    /** 下一个建议面在**设备坐标系**下的水平方向，用来画"该往哪边转"的箭头 */
+    /** 下一个建议面在**设备坐标系**下的水平方向，用来画"该往哪边转"的箭头与文案 */
     private var nextX = 0f
     private var nextY = 0f
     private var hasTarget = false
 
     /** 已完成的面数（来自渲染线程 Stats，驱动中央文字与左上角面板） */
     private var doneCount = 0
+
+    /** 已完成面的位掩码，驱动 8 段进度环 */
+    private var sectorDoneMask = 0
+
+    /** 镜头当前正对哪个面 / 建议采集哪个面 */
+    private var camSector = 0
+    private var targetSector = 0
+
+    /** 镜头正对的那个面「已对准多久」0..1 */
+    private var camDwell = 0f
+
+    /** 8 段进度环的填充动画 0..1（目标值就是位掩码里的 0/1，逐帧追赶） */
+    private val segFill = FloatArray(SECTOR_COUNT)
 
     private var autoCapture = true
     private var autoOrbit = false
@@ -101,6 +124,25 @@ class HudView @JvmOverloads constructor(
     private var bannerStartMs = 0L
     private var bannerShown = false
 
+    /** 上一次看到的 doneCount，用于检测「刚刚全部完成」并给出庆祝反馈 */
+    private var lastDoneCount = 0
+
+    /**
+     * 启动瞬间的那次自动采集不算用户操作，不震。
+     * App 一打开镜头正对的面停留 0.22s 就会自动记一面（固有行为），
+     * 此时用户什么都还没做，震一下只会让人困惑。
+     */
+    private var firstCaptureEventSkipped = false
+
+    // ---- 重置防误触：第一次点只是"上膛" ----
+    private var resetArmed = false
+    private var resetArmedMs = 0L
+
+    // ---- 首次引导 ----
+    /** -1 = 不显示；0..SIZE-1 = 当前页 */
+    private var onboardingStep = -1
+    private var pressedOnboardSkip = false
+
     // 触摸状态
     private var pressedShutter = false
     private var pressedMode = false
@@ -110,6 +152,12 @@ class HudView @JvmOverloads constructor(
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var dragging = false
+
+    /** 点按即可「重新扫描」的区域（采集完成后的横幅），每帧由 drawBanner 写入 */
+    private val bannerHitRect = RectF()
+
+    /** 引导页「跳过」按钮的点击区，每帧由 drawOnboarding 写入 */
+    private val onboardSkipRect = RectF()
 
     // 画笔
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -187,6 +235,19 @@ class HudView @JvmOverloads constructor(
 
     // ------------------------------------------------------------------ 外部更新
 
+    /**
+     * 开启首次使用引导。
+     *
+     * 引导期间由 [MainActivity] 暂停自动采集，所以看完之后进度是从真正的 0 开始的，
+     * 而不是"一打开就已经拍了 1/8"。
+     */
+    fun startOnboarding() {
+        onboardingStep = 0
+        postInvalidateOnAnimation()
+    }
+
+    val isOnboarding: Boolean get() = onboardingStep >= 0
+
     fun updateState(
         stats: GuideSphereRenderer.Stats,
         autoCapture: Boolean,
@@ -199,7 +260,6 @@ class HudView @JvmOverloads constructor(
     ) {
         this.coverageTarget = stats.coverage
         this.lit = stats.lit
-        this.inFrameUnlit = stats.inFrameUnlit
         this.fps = stats.fps
         this.drawMs = stats.drawMs
         if (stats.sphereRadiusPx > 0f) this.sphereRadiusPx = stats.sphereRadiusPx
@@ -211,6 +271,10 @@ class HudView @JvmOverloads constructor(
         this.nextY = stats.nextY
         this.hasTarget = stats.hasTarget
         this.doneCount = stats.doneCount
+        this.sectorDoneMask = stats.sectorDoneMask
+        this.camSector = stats.camSector
+        this.targetSector = stats.targetSector
+        this.camDwell = stats.camFaceProgress
         this.autoCapture = autoCapture
         this.autoOrbit = autoOrbit
         this.sourceLabel = sourceLabel
@@ -219,10 +283,23 @@ class HudView @JvmOverloads constructor(
         this.permissionGranted = permissionGranted
         this.hasCamera = hasCamera
 
+        // 检测「刚刚拍下一个面」：batchFlash 只在批次产生的头 1~2 次采样里高于 0.85，
+        // 天然就是一次性事件，不会重复触发。
         if (stats.lastBatch > 0 && stats.batchFlash > 0.85f) {
             batchValue = stats.lastBatch
             batchStartMs = SystemClock.elapsedRealtime()
+            if (!firstCaptureEventSkipped) {
+                firstCaptureEventSkipped = true          // 启动瞬间那次自动采集不震
+            } else if (onboardingStep < 0) {
+                haptics.faceCaptured()
+            }
         }
+
+        if (stats.doneCount > lastDoneCount && stats.doneCount >= SECTOR_COUNT) {
+            if (onboardingStep < 0) haptics.allDone()
+        }
+        lastDoneCount = stats.doneCount
+
         if (coverageTarget >= 0.999f) {
             if (!bannerShown) {
                 bannerShown = true
@@ -236,6 +313,7 @@ class HudView @JvmOverloads constructor(
 
     fun notifyShutter() {
         shutterFlashMs = SystemClock.elapsedRealtime()
+        haptics.tick()
         postInvalidateOnAnimation()
     }
 
@@ -259,6 +337,24 @@ class HudView @JvmOverloads constructor(
             coverageAnim = coverageTarget
         }
 
+        // 8 段进度环各自的填充动画
+        for (s in 0 until SECTOR_COUNT) {
+            val goal = if ((sectorDoneMask shr s) and 1 == 1) 1f else 0f
+            val cur = segFill[s]
+            if (abs(goal - cur) > 0.004f) {
+                segFill[s] = cur + (goal - cur) * min(1f, dt * 10f)
+                animating = true
+            } else {
+                segFill[s] = goal
+            }
+        }
+
+        // 「确认重置」的自动撤防
+        if (resetArmed && now - resetArmedMs > RESET_ARM_MS) {
+            resetArmed = false
+            animating = true
+        }
+
         drawCaptureBrackets(canvas)
         // 中央引导文字（替换原 8 段扇形环）：提示用户绕物体旋转一周
         drawCenterGuideText(canvas)
@@ -273,18 +369,22 @@ class HudView @JvmOverloads constructor(
         drawShutterFlash(canvas, now)
         drawBanner(canvas, now)
 
+        // 引导页盖在所有内容之上，但相机权限遮罩优先级更高
+        if (onboardingStep >= 0 && permissionGranted && hasCamera) drawOnboarding(canvas)
+
         if (!permissionGranted || !hasCamera) drawPermissionOverlay(canvas)
 
-        // 一次性决定本帧结束后要不要继续重绘：覆盖度还在平滑、或横幅/提示还在动。
+        // 一次性决定本帧结束后要不要继续重绘：覆盖度还在平滑、环形还在追、或横幅/提示还在动。
         // （drawBatchToast / drawShutterFlash / drawBanner 内部不再各自重复调用。）
-        if (animating || bannerShown || batchValue > 0 || shutterFlashMs != 0L) {
+        if (animating || bannerShown || batchValue > 0 || shutterFlashMs != 0L || resetArmed) {
             postInvalidateOnAnimation()
         }
     }
 
     /**
      * 四角取景框：把被摄物体框在画面里，提示"拍的就是中间这个物体"。
-     * 捕获粒度是「面」，判定只看相机朝向、与取景框无关，所以这里纯粹是视觉引导。
+     * 捕获粒度是「面」，判定只看相机朝向、与取景框无关，所以这里纯粹是视觉引导；
+     * 全部扫完后转成青绿，作为"框里这个东西已经拍齐了"的收尾暗示。
      */
     private fun drawCaptureBrackets(canvas: Canvas) {
         // 距离屏幕边缘留一条窄边，避免贴边被系统手势区吃掉
@@ -300,7 +400,11 @@ class HudView @JvmOverloads constructor(
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 2f * d
         paint.strokeCap = Paint.Cap.ROUND
-        paint.color = if (autoCapture) cAccentDim else Color.parseColor("#59FFC061")
+        paint.color = when {
+            coverageTarget >= 0.999f -> cLit
+            autoCapture -> cAccentDim
+            else -> Color.parseColor("#59FFC061")
+        }
 
         path.reset()
         // 左上
@@ -319,11 +423,13 @@ class HudView @JvmOverloads constructor(
     }
 
     /**
-     * 屏幕中央引导文字：替换原 8 段扇形环。
+     * 屏幕中央引导文字。
      *
-     * 用户要求去掉「球体上方的扇形装饰」，改用文字提示「绕物体旋转一周」来引导完成
-     * 环绕物体的完整旋转。球面已用 8 面点阵 + 目标面琥珀高亮表达进度，中央只保留一句
-     * 简明的文字指令；全部 8 面扫完时切换为「采集完成」作为明确的完成反馈。
+     * 文案随状态变化，而不是从头到尾一句「绕物体旋转一周」：
+     *  - 还没开始   → 告诉用户把物体放进框里、缓慢环绕；
+     *  - 对准中     → 「已对准 · 保持」，配合进度环外圈那段小弧，让"马上就要拍到了"可见；
+     *  - 有明确目标 → 直接给出方向词（向右转 / 向左转 / 抬高手机），比一个箭头更好懂；
+     *  - 全部完成   → 「采集完成」，点按横幅即可重扫。
      */
     private fun drawCenterGuideText(canvas: Canvas) {
         val cx = w * 0.5f
@@ -339,58 +445,139 @@ class HudView @JvmOverloads constructor(
             return
         }
 
-        val guide = if (allDone) "采集完成" else "绕物体旋转一周"
+        val main: String
+        val sub: String
+        val mainColor: Int
+        when {
+            allDone -> {
+                main = "采集完成"
+                sub = "8 个面全部点亮"
+                mainColor = cLit
+            }
+            camDwell > 0.02f -> {
+                main = "已对准 · 保持不动"
+                sub = "正在采集这一面 ${(camDwell * 100f).toInt()}%"
+                mainColor = cAccent
+            }
+            hasTarget -> {
+                main = dirWord()
+                sub = "还剩 ${(SECTOR_COUNT - done).coerceAtLeast(0)} 个面待采集"
+                mainColor = cText
+            }
+            else -> {
+                main = "缓慢环绕物体"
+                sub = "镜头对准哪一面，那一面就会亮起"
+                mainColor = cText
+            }
+        }
+
         boldPaint.textAlign = Paint.Align.CENTER
         boldPaint.textSize = 19f * scaledDensity
-        boldPaint.color = if (allDone) cLit else cText
+        boldPaint.color = mainColor
         val base = cy - (boldPaint.descent() + boldPaint.ascent()) * 0.5f
-        canvas.drawText(guide, cx, base, boldPaint)
+        canvas.drawText(main, cx, base, boldPaint)
 
-        // 小字副提示：已完成面数（仅作轻量进度提示，不喧宾夺主）
-        if (!allDone) {
-            textPaint.textAlign = Paint.Align.CENTER
-            textPaint.textSize = 12f * scaledDensity
-            textPaint.color = cTextDim
-            val subY = cy + 18f * scaledDensity
-            canvas.drawText("已标记 $done/$SECTOR_COUNT 个面", cx, subY, textPaint)
-        }
+        textPaint.textAlign = Paint.Align.CENTER
+        textPaint.textSize = 12f * scaledDensity
+        textPaint.color = cTextDim
+        canvas.drawText(sub, cx, cy + 18f * scaledDensity, textPaint)
 
         boldPaint.textAlign = Paint.Align.LEFT
         textPaint.textAlign = Paint.Align.LEFT
     }
 
-    /** 套在球外侧的覆盖度进度环 */
+    /**
+     * 由目标方向（设备坐标系）换算成一句人话。
+     *
+     * +x = 屏幕右、+y = 屏幕上，所以屏幕上方的目标就是"抬高手机"。
+     * 阈值取 0.10：接近光轴时不再催，改成"保持不动"，避免用户在手已经在正确位置时瞎调。
+     */
+    private fun dirWord(): String {
+        val t = 0.10f
+        return when {
+            nextY >= t && nextY >= abs(nextX) -> "抬高手机"
+            nextY <= -t && -nextY >= abs(nextX) -> "压低手机"
+            nextX > t -> "向右转"
+            nextX < -t -> "向左转"
+            else -> "保持不动"
+        }
+    }
+
+    /**
+     * 覆盖度进度环：**8 段**，一段 = 一个待采集的面。
+     *
+     * 换成 8 段之后，环上的信息量和球面的 8 面点阵一一对应 ——
+     * 「还差 3 段」和「球上还剩 3 片没亮」是同一件事，用户不用在两种表达之间换算。
+     * 环外那一小段更细的弧是"当前这一面已经对准了多少"。
+     */
     private fun drawCoverageRing(canvas: Canvas) {
         val r = ringRadius
         val cx = sphereCx
         val cy = sphereCy
         ringRect.set(cx - r, cy - r, cx + r, cy + r)
 
+        val seg = 360f / SECTOR_COUNT
+        val gap = 7f
+
         paint.reset()
         paint.style = Paint.Style.STROKE
         paint.strokeCap = Paint.Cap.ROUND
 
-        // 轨道
+        // ---- 轨道：8 段暗底 ----
         paint.strokeWidth = 3f * d
         paint.color = Color.parseColor("#2EFFFFFF")
-        canvas.drawArc(ringRect, 0f, 360f, false, paint)
+        for (s in 0 until SECTOR_COUNT) {
+            canvas.drawArc(ringRect, -90f + s * seg + gap * 0.5f, seg - gap, false, paint)
+        }
 
-        // 进度
-        paint.strokeWidth = 4.5f * d
-        paint.color = blend(cAccent, cLit, coverageAnim)
-        val sweep = 360f * coverageAnim.coerceIn(0f, 1f)
-        canvas.drawArc(ringRect, -90f, sweep, false, paint)
+        // ---- 已完成 / 正在填充的段 ----
+        paint.strokeWidth = 5f * d
+        for (s in 0 until SECTOR_COUNT) {
+            val f = segFill[s]
+            if (f <= 0.004f) continue
+            paint.color = blend(cAccent, cLit, f)
+            canvas.drawArc(ringRect, -90f + s * seg + gap * 0.5f, (seg - gap) * f, false, paint)
+        }
 
-        // 末端光点
-        if (sweep > 1f) {
-            val rad = Math.toRadians((-90f + sweep).toDouble())
-            val px = cx + (r * kotlin.math.cos(rad)).toFloat()
-            val py = cy + (r * kotlin.math.sin(rad)).toFloat()
-            paint.style = Paint.Style.FILL
-            paint.color = Color.parseColor("#66FFFFFF")
-            canvas.drawCircle(px, py, 6f * d, paint)
-            paint.color = Color.WHITE
-            canvas.drawCircle(px, py, 3f * d, paint)
+        // ---- 目标段：琥珀呼吸，指出"下一段该往哪边补" ----
+        val targetOpen = doneCount < SECTOR_COUNT && (sectorDoneMask shr targetSector) and 1 == 0
+        if (targetOpen && segFill[targetSector] < 0.5f) {
+            val breath = 0.45f + 0.55f * (0.5f + 0.5f * kotlin.math.sin(lastFrameMs / 380.0).toFloat())
+            paint.strokeWidth = 3f * d
+            paint.color = withAlpha(cWarn, 150f * breath)
+            canvas.drawArc(
+                ringRect, -90f + targetSector * seg + gap * 0.5f, seg - gap, false, paint
+            )
+        }
+
+        // ---- 外圈：当前面的「对准进度」 ----
+        if (autoCapture && camDwell > 0.01f && doneCount < SECTOR_COUNT) {
+            val outer = r + 7f * d
+            ringRect.set(cx - outer, cy - outer, cx + outer, cy + outer)
+            paint.strokeWidth = 2.5f * d
+            paint.color = withAlpha(cAccent, 235f)
+            canvas.drawArc(
+                ringRect, -90f + camSector * seg + gap * 0.5f, (seg - gap) * camDwell, false, paint
+            )
+            paint.strokeWidth = 1.5f * d
+            paint.color = Color.parseColor("#40FFFFFF")
+            canvas.drawArc(
+                ringRect, -90f + camSector * seg + gap * 0.5f, seg - gap, false, paint
+            )
+            ringRect.set(cx - r, cy - r, cx + r, cy + r)
+        } else {
+            // 末端光点：只在整环视角上给一个"进度头"，段填充本身已经足够表达
+            val filled = (0 until SECTOR_COUNT).sumOf { segFill[it].toDouble() }.toFloat() / SECTOR_COUNT
+            if (filled > 0.01f) {
+                val rad = Math.toRadians((-90f + 360f * filled).toDouble())
+                val px = cx + (r * kotlin.math.cos(rad)).toFloat()
+                val py = cy + (r * kotlin.math.sin(rad)).toFloat()
+                paint.style = Paint.Style.FILL
+                paint.color = Color.parseColor("#66FFFFFF")
+                canvas.drawCircle(px, py, 6f * d, paint)
+                paint.color = Color.WHITE
+                canvas.drawCircle(px, py, 3f * d, paint)
+            }
         }
     }
 
@@ -398,7 +585,7 @@ class HudView @JvmOverloads constructor(
      * 停靠在画面下方的引导球面板。
      *
      * 球缩小之后需要明确它"代表什么"：圆角边框把它框成一个独立的小窗，
-     * 下方的「物体」标签点明它就是被拍摄的那个物体，右侧标出还差多少个面。
+     * 下方的「物体」标签点明它就是被拍摄的那个物体，右侧标出当前该做什么。
      * 中间的大片画面因此完全让给了真实相机预览。
      */
     private fun drawSphereDock(canvas: Canvas) {
@@ -450,16 +637,21 @@ class HudView @JvmOverloads constructor(
         canvas.drawText(labelText, iconCx + iconR + 9f * d, ty, textPaint)
 
         // ---- 右下角：状态 ----
-        // 文案刻意压到 6 个字以内：这一行要和左边的「物体」胶囊并排塞进
+        // 文案刻意压到 7 个字以内：这一行要和左边的「物体」胶囊并排塞进
         // 球体面板的宽度里，写长了就会互相压字。
+        // 注意「框内 N 个」这类旧文案已经不成立了 —— 捕获粒度是「面」，
+        // 取景框早就不参与判定，再按"框内还剩几个点"表达会误导用户。
         val status: String
         val statusColor: Int
         when {
             !permissionGranted -> { status = "待授权"; statusColor = cWarn }
             !hasCamera -> { status = "无相机"; statusColor = cWarn }
             coverageTarget >= 0.999f -> { status = "全部覆盖 ✓"; statusColor = cLit }
-            lit == 0 -> { status = "缓慢环绕物体"; statusColor = cTextDim }
-            inFrameUnlit > 0 -> { status = "框内 $inFrameUnlit 个"; statusColor = cAccent }
+            camDwell > 0.02f -> {
+                status = "采集中 ${(camDwell * 100f).toInt()}%"
+                statusColor = cAccent
+            }
+            hasTarget -> { status = dirWord(); statusColor = cAccent }
             else -> { status = "还差 ${(SECTOR_COUNT - doneCount).coerceAtLeast(0)} 个面"; statusColor = cTextDim }
         }
         textPaint.textSize = 11.5f * scaledDensity
@@ -489,8 +681,12 @@ class HudView @JvmOverloads constructor(
         val px = cx + dx * dist
         val py = cy + dy * dist
 
+        // 箭头外一层柔光，在明亮的相机画面上也能看清
         paint.reset()
         paint.style = Paint.Style.FILL
+        paint.color = withAlpha(cWarn, near * 60f)
+        canvas.drawCircle(px, py, 15f * d, paint)
+
         paint.color = withAlpha(cWarn, near * 235f)
 
         // 一个指向 (dx, dy) 的实心三角
@@ -533,19 +729,23 @@ class HudView @JvmOverloads constructor(
         textPaint.color = cTextDim
         canvas.drawText("已拍 $doneCount / $SECTOR_COUNT 个面", x + pctWidth + 8f * d, y + 30f * scaledDensity, textPaint)
 
-        // 细进度条
+        // 与环形进度条同构的 8 个小方块：一眼看出还缺哪几面，比一根连续进度条信息量大
         val barTop = rect.bottom - 18f * d
         val barLeft = x
         val barRight = rect.right - 14f * d
-        paint.reset()
-        paint.style = Paint.Style.FILL
-        paint.color = Color.parseColor("#33FFFFFF")
-        rect.set(barLeft, barTop, barRight, barTop + 5f * d)
-        canvas.drawRoundRect(rect, 3f * d, 3f * d, paint)
-        if (coverageAnim > 0.001f) {
-            rect.set(barLeft, barTop, barLeft + (barRight - barLeft) * coverageAnim, barTop + 5f * d)
-            paint.color = blend(cAccent, cLit, coverageAnim)
-            canvas.drawRoundRect(rect, 3f * d, 3f * d, paint)
+        val blockGap = 3f * d
+        val blockW = (barRight - barLeft - blockGap * (SECTOR_COUNT - 1)) / SECTOR_COUNT
+        for (s in 0 until SECTOR_COUNT) {
+            val left = barLeft + s * (blockW + blockGap)
+            rect.set(left, barTop, left + blockW, barTop + 5f * d)
+            paint.reset()
+            paint.style = Paint.Style.FILL
+            paint.color = if (segFill[s] > 0.004f) {
+                blend(cAccent, cLit, segFill[s])
+            } else {
+                Color.parseColor("#33FFFFFF")
+            }
+            canvas.drawRoundRect(rect, 2.5f * d, 2.5f * d, paint)
         }
     }
 
@@ -594,7 +794,7 @@ class HudView @JvmOverloads constructor(
         canvas.drawText(text, r.left + 10f * d, ty, textPaint)
     }
 
-    /** 底部：快门、模式切换、重置、自动巡航、提示文案 */
+    /** 底部：快门、模式切换、重置、自动巡航 */
     private fun drawBottomBar(canvas: Canvas) {
         // ---- 快门 ----
         paint.reset()
@@ -612,6 +812,7 @@ class HudView @JvmOverloads constructor(
         paint.color = if (autoCapture) blend(cAccent, cLit, coverageAnim) else Color.WHITE
         canvas.drawCircle(shutterCx, shutterCy, innerR, paint)
 
+        // 自动采样时快门仍然可点（等于"现在就拍这一面"），文案点明这一点
         textPaint.textSize = 10f * scaledDensity
         textPaint.color = cText
         val label = if (autoCapture) "采样中" else "拍摄"
@@ -630,8 +831,13 @@ class HudView @JvmOverloads constructor(
             pressedMode
         )
 
-        // ---- 重置 ----
-        drawPill(canvas, resetRect, "重置", cTextDim, pressedReset)
+        // ---- 重置：点两次才生效，防误触清空已扫进度 ----
+        drawPill(
+            canvas, resetRect,
+            if (resetArmed) "确认重置" else "重置",
+            if (resetArmed) cWarn else cTextDim,
+            pressedReset || resetArmed
+        )
 
         // ---- 自动巡航 ----
         drawPill(
@@ -640,10 +846,6 @@ class HudView @JvmOverloads constructor(
             if (autoOrbit) cAccent else cTextDim,
             pressedCruise
         )
-
-        // 提示文案已经并入球体停靠面板右下角的状态行：
-        // 底部这块只剩快门与两个胶囊，再把一整行字塞进快门上方，
-        // 会和「物体」胶囊挤在同一高度上互相压字。
     }
 
     private fun drawPill(canvas: Canvas, r: RectF, text: String, accent: Int, pressed: Boolean) {
@@ -700,15 +902,18 @@ class HudView @JvmOverloads constructor(
         canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
     }
 
-    /** 覆盖完成横幅 */
+    /**
+     * 覆盖完成横幅。整块可点 —— 点它就是「再来一轮」，
+     * 不必再回到底部找那个需要二次确认的「重置」。
+     */
     private fun drawBanner(canvas: Canvas, now: Long) {
         if (!bannerShown) return
         val elapsed = (now - bannerStartMs) / 1000f
         val enter = min(1f, elapsed / 0.35f)
         val pulse = 0.5f + 0.5f * kotlin.math.sin(elapsed * 3.4).toFloat()
 
-        val bw = 236f * d
-        val bh = 62f * d
+        val bw = 250f * d
+        val bh = 78f * d
         val cx = w * 0.5f
         // 横条要同时避开右上角的状态芯片列与球体的停靠面板：
         // 优先贴在停靠面板上方（"已捕获 +N" 浮动提示的地盘下面），空间不够时才退到芯片列正下方。
@@ -718,6 +923,7 @@ class HudView @JvmOverloads constructor(
         val preferred = ringTop - bh * 0.5f - 56f * d
         val cy = maxOf(minCy, preferred) + (1f - easeOut(enter)) * -20f * d
         rect.set(cx - bw * 0.5f, cy - bh * 0.5f, cx + bw * 0.5f, cy + bh * 0.5f)
+        bannerHitRect.set(rect)
 
         paint.reset()
         paint.style = Paint.Style.FILL
@@ -730,7 +936,7 @@ class HudView @JvmOverloads constructor(
 
         // 对勾
         val tickX = rect.left + 26f * d
-        val tickY = cy
+        val tickY = cy - 12f * d
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 3f * d
         paint.strokeCap = Paint.Cap.ROUND
@@ -743,12 +949,166 @@ class HudView @JvmOverloads constructor(
 
         boldPaint.textSize = 15f * scaledDensity
         boldPaint.color = withAlpha(Color.WHITE, enter * 255f)
-        canvas.drawText("360° 无死角覆盖完成", tickX + 20f * d, cy - 3f * d, boldPaint)
+        canvas.drawText("360° 无死角覆盖完成", tickX + 20f * d, tickY - 4f * d, boldPaint)
 
         textPaint.textSize = 11f * scaledDensity
         textPaint.color = withAlpha(cTextDim, enter * 255f)
-        canvas.drawText("可以提交给重建算法了", tickX + 20f * d, cy + 14f * d, textPaint)
+        canvas.drawText("可以提交给三维重建算法了", tickX + 20f * d, tickY + 14f * d, textPaint)
+
+        // 明确告诉用户这里可以点，不然"点横幅重扫"是个藏起来的功能
+        textPaint.textSize = 11.5f * scaledDensity
+        textPaint.color = withAlpha(cAccent, (0.6f + 0.4f * pulse) * enter * 255f)
+        canvas.drawText("点按此处重新扫描", tickX + 20f * d, tickY + 32f * d, textPaint)
     }
+
+    // ------------------------------------------------------------------ 首次引导
+
+    /**
+     * 三页图文引导。
+     *
+     * 不做的话，第一次打开看到的就是"一个灰球 + 一堆点点 + 一句话"，
+     * 用户得自己猜该干嘛。这里把三件必须知道的事按顺序讲清楚：
+     * 物体放哪、手机怎么动、什么时候算完。
+     */
+    private fun drawOnboarding(canvas: Canvas) {
+        val step = onboardingStep.coerceIn(0, ONBOARDING_TITLES.size - 1)
+
+        // 遮罩
+        paint.reset()
+        paint.style = Paint.Style.FILL
+        paint.color = Color.parseColor("#D9060B14")
+        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+
+        val panelW = min(w - 2f * pad - 8f * d, 320f * d)
+        val panelH = 268f * d
+        val cx = w * 0.5f
+        val top = h * 0.5f - panelH * 0.5f
+        // 面板自身的边界单独存一份：下面画按钮时会把 rect 改写成按钮矩形，
+        // 「跳过」若再去读 rect 就会跑到按钮旁边去。
+        val panelRight = cx + panelW * 0.5f
+        val panelTop = top
+        rect.set(cx - panelW * 0.5f, top, panelRight, top + panelH)
+
+        paint.style = Paint.Style.FILL
+        paint.color = Color.parseColor("#F2101826")
+        canvas.drawRoundRect(rect, 20f * d, 20f * d, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 1.4f * d
+        paint.color = Color.parseColor("#3D4DE1FF")
+        canvas.drawRoundRect(rect, 20f * d, 20f * d, paint)
+
+        // ---- 序号圆章 ----
+        val badgeR = 21f * d
+        val badgeCy = rect.top + 42f * d
+        paint.style = Paint.Style.FILL
+        paint.color = Color.parseColor("#264DE1FF")
+        canvas.drawCircle(cx, badgeCy, badgeR, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 1.6f * d
+        paint.color = cAccent
+        canvas.drawCircle(cx, badgeCy, badgeR, paint)
+        boldPaint.textAlign = Paint.Align.CENTER
+        boldPaint.textSize = 18f * scaledDensity
+        boldPaint.color = cAccent
+        canvas.drawText(
+            "${step + 1}",
+            cx,
+            badgeCy - (boldPaint.descent() + boldPaint.ascent()) * 0.5f,
+            boldPaint
+        )
+
+        // ---- 标题 ----
+        boldPaint.textSize = 17f * scaledDensity
+        boldPaint.color = cText
+        val titleY = badgeCy + 42f * d
+        canvas.drawText(ONBOARDING_TITLES[step], cx, titleY, boldPaint)
+
+        // ---- 正文（按字符贪心折行，中文不需要按词断） ----
+        textPaint.textAlign = Paint.Align.LEFT
+        textPaint.textSize = 12.5f * scaledDensity
+        textPaint.color = cTextDim
+        val bodyLeft = rect.left + 26f * d
+        val bodyMaxW = panelW - 52f * d
+        drawWrappedText(
+            canvas,
+            ONBOARDING_BODIES[step],
+            bodyLeft,
+            titleY + 26f * d,
+            bodyMaxW,
+            textPaint,
+            19f * scaledDensity
+        )
+
+        // ---- 页码圆点 ----
+        val dotR = 3.5f * d
+        val dotGap = 12f * d
+        val dotsY = rect.bottom - 62f * d
+        val dotsW = (ONBOARDING_TITLES.size - 1) * dotGap
+        for (i in ONBOARDING_TITLES.indices) {
+            val dx = cx - dotsW * 0.5f + i * dotGap
+            paint.style = Paint.Style.FILL
+            paint.color = if (i == step) cAccent else Color.parseColor("#40FFFFFF")
+            canvas.drawCircle(dx, dotsY, if (i == step) dotR * 1.25f else dotR, paint)
+        }
+
+        // ---- 主按钮：点哪都能翻页，这里只是把"点哪"说清楚 ----
+        val btn = if (step == ONBOARDING_TITLES.size - 1) "开始扫描" else "下一步"
+        val btnH = 40f * d
+        rect.set(cx - 82f * d, rect.bottom - 46f * d, cx + 82f * d, rect.bottom - 46f * d + btnH)
+        paint.style = Paint.Style.FILL
+        paint.color = if (step == ONBOARDING_TITLES.size - 1) cLit else cAccent
+        canvas.drawRoundRect(rect, btnH * 0.5f, btnH * 0.5f, paint)
+        textPaint.textAlign = Paint.Align.CENTER
+        textPaint.textSize = 14f * scaledDensity
+        textPaint.color = Color.parseColor("#FF05131C")
+        canvas.drawText(
+            btn,
+            rect.centerX(),
+            rect.centerY() - (textPaint.descent() + textPaint.ascent()) * 0.5f,
+            textPaint
+        )
+
+        // ---- 跳过（面板右上角，小字） ----
+        textPaint.textSize = 12f * scaledDensity
+        textPaint.color = if (pressedOnboardSkip) cText else cTextDim
+        val skipW = textPaint.measureText("跳过")
+        val skipX = panelRight - 18f * d - skipW
+        val skipY = panelTop + 24f * d
+        canvas.drawText("跳过", skipX, skipY, textPaint)
+        onboardSkipRect.set(skipX - 12f * d, skipY - 16f * d, skipX + skipW + 12f * d, skipY + 10f * d)
+
+        textPaint.textAlign = Paint.Align.LEFT
+        boldPaint.textAlign = Paint.Align.LEFT
+    }
+
+    /** 按字符贪心折行并绘制，返回下一行的基线 y */
+    private fun drawWrappedText(
+        canvas: Canvas,
+        text: String,
+        left: Float,
+        top: Float,
+        maxWidth: Float,
+        p: Paint,
+        lineHeight: Float
+    ): Float {
+        var line = StringBuilder()
+        var y = top
+        for (ch in text) {
+            if (line.isNotEmpty() && p.measureText(line.toString() + ch) > maxWidth) {
+                canvas.drawText(line.toString(), left, y, p)
+                y += lineHeight
+                line = StringBuilder()
+            }
+            line.append(ch)
+        }
+        if (line.isNotEmpty()) {
+            canvas.drawText(line.toString(), left, y, p)
+            y += lineHeight
+        }
+        return y
+    }
+
+    // ------------------------------------------------------------------ 权限遮罩
 
     private fun drawPermissionOverlay(canvas: Canvas) {
         paint.reset()
@@ -788,6 +1148,36 @@ class HudView @JvmOverloads constructor(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x
         val y = event.y
+
+        // ---- 首次引导期间接管全部触摸：点哪都翻页，只有「跳过」提前结束 ----
+        if (onboardingStep >= 0 && permissionGranted && hasCamera) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    pressedOnboardSkip = onboardSkipRect.contains(x, y)
+                    invalidate()
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val wasSkip = pressedOnboardSkip
+                    pressedOnboardSkip = false
+                    haptics.tick()
+                    if (wasSkip || onboardingStep >= ONBOARDING_TITLES.size - 1) {
+                        finishOnboarding()
+                    } else {
+                        onboardingStep++
+                    }
+                    invalidate()
+                    return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    pressedOnboardSkip = false
+                    invalidate()
+                    return true
+                }
+            }
+            return true
+        }
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 lastTouchX = x
@@ -799,6 +1189,14 @@ class HudView @JvmOverloads constructor(
                     return true
                 }
                 if (permissionGranted && hasCamera) {
+                    // 完成后的横幅整块可点 = 重新扫描（比底部那个要二次确认的「重置」顺手）
+                    if (bannerShown && bannerHitRect.contains(x, y)) {
+                        listener?.onReset()
+                        haptics.tick()
+                        bannerShown = false
+                        invalidate()
+                        return true
+                    }
                     val dx = x - shutterCx
                     val dy = y - shutterCy
                     if (dx * dx + dy * dy <= (shutterR + 12f * d) * (shutterR + 12f * d)) {
@@ -849,6 +1247,7 @@ class HudView @JvmOverloads constructor(
                     pressedMode = false
                     if (event.actionMasked == MotionEvent.ACTION_UP) {
                         autoCapture = listener?.onToggleAutoCapture() ?: autoCapture
+                        haptics.tick()
                     }
                     invalidate()
                     return true
@@ -856,8 +1255,18 @@ class HudView @JvmOverloads constructor(
                 if (pressedReset) {
                     pressedReset = false
                     if (event.actionMasked == MotionEvent.ACTION_UP) {
-                        bannerShown = false
-                        listener?.onReset()
+                        if (resetArmed) {
+                            // 第二次点击：真正清空
+                            resetArmed = false
+                            bannerShown = false
+                            haptics.faceCaptured()
+                            listener?.onReset()
+                        } else {
+                            // 第一次点击：上膛，等一次确认
+                            resetArmed = true
+                            resetArmedMs = SystemClock.elapsedRealtime()
+                            haptics.tick()
+                        }
                     }
                     invalidate()
                     return true
@@ -866,6 +1275,7 @@ class HudView @JvmOverloads constructor(
                     pressedCruise = false
                     if (event.actionMasked == MotionEvent.ACTION_UP) {
                         autoOrbit = listener?.onToggleAutoOrbit() ?: autoOrbit
+                        haptics.tick()
                     }
                     invalidate()
                     return true
@@ -883,6 +1293,18 @@ class HudView @JvmOverloads constructor(
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    private fun finishOnboarding() {
+        onboardingStep = -1
+        pressedOnboardSkip = false
+        // 引导期间进度是被冻结的，这里把 HUD 侧的状态归零，避免残留旧数据
+        for (s in 0 until SECTOR_COUNT) segFill[s] = 0f
+        // 引导期间没有产生任何采集事件，所以"启动那次自动采集不震"的豁免名额
+        // 已经被这段引导消耗掉了 —— 之后用户的第一次真实采集必须正常给反馈。
+        firstCaptureEventSkipped = true
+        listener?.onOnboardingFinished()
+        invalidate()
     }
 
     // ------------------------------------------------------------------ 工具
@@ -922,10 +1344,25 @@ class HudView @JvmOverloads constructor(
         const val DOCK_FILL = 0x14FFFFFF
         const val DOCK_STROKE = 0x4DFFFFFF
 
-        /** 方位扇区数量（与 ScanSession 保持一致）：中央文字用「已标记 N/8 个面」 */
+        /** 方位扇区数量（与 ScanSession 保持一致）：8 段进度环 / 「已拍 N/8 个面」 */
         const val SECTOR_COUNT = 8
 
         /** 中央引导文字纵向锚点（0 = 顶部，1 = 底部），居中偏上、避开底部球面板 */
         const val CENTER_GUIDE_Y = 0.46f
+
+        /** 「重置」上膛后多久自动撤防（毫秒） */
+        const val RESET_ARM_MS = 2500L
+
+        /** 首次引导的三页文案 */
+        val ONBOARDING_TITLES = arrayOf(
+            "把物体放进取景框",
+            "绕着物体缓慢转一圈",
+            "8 个面全亮就完成"
+        )
+        val ONBOARDING_BODIES = arrayOf(
+            "让被摄物体完整落在四角的框内，镜头与它保持一臂左右的距离。",
+            "镜头正对球面上的哪一面，那一面的光点就会整片亮起，同时手机轻震一下。",
+            "全部点亮后会弹出完成提示，点它即可开始下一轮。"
+        )
     }
 }

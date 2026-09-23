@@ -46,6 +46,9 @@ class MainActivity : ComponentActivity(), HudView.Listener {
     private var permissionGranted = false
     private var hasCamera = false
 
+    /** 首次使用引导是否正在显示（期间冻结自动采集，让进度从真正的 0 开始） */
+    private var onboardingActive = false
+
     /** 统计日志节流时间戳 */
     private var lastLogMs = 0L
 
@@ -108,12 +111,33 @@ class MainActivity : ComponentActivity(), HudView.Listener {
             pushHudState()
         }
 
+        maybeStartOnboarding()
+
         // 兜底：设备确实没有可用的方向传感器时，切到"触摸拖拽 / 自动巡航"，
         // 保证功能始终可用。
         // 这里刻意做成周期检查而不是一次性定时器 —— 传感器冷启动时首个采样
         // 可能晚到好几秒（部分 ROM 的省电策略会拖后腿），一次性判定会把
         // "还没启动好"误判成"没有传感器"，而且进了手动模式就再也回不来。
         mainHandler.post(sensorWatchdog)
+    }
+
+    /**
+     * 首次启动时展示三页引导。
+     *
+     * 引导期间把自动采集冻结掉：App 一打开，镜头正对的那个面停留 0.22s 就会被记一面，
+     * 用户什么都还没做进度就已经是 12.5% —— 配上引导页会显得很莫名。
+     * 无相机硬件时直接跳过引导，否则永远不会有人来关闭它。
+     */
+    private fun maybeStartOnboarding() {
+        if (prefs.getBoolean(KEY_ONBOARDING_DONE, false)) return
+        if (!hasCamera) {
+            prefs.edit().putBoolean(KEY_ONBOARDING_DONE, true).apply()
+            return
+        }
+        onboardingActive = true
+        glView.renderer.autoCapture = false
+        hudView.startOnboarding()
+        pushHudState()
     }
 
     override fun onResume() {
@@ -190,7 +214,8 @@ class MainActivity : ComponentActivity(), HudView.Listener {
         android.util.Log.i(
             "GuideSphereStats",
             "cov=${(stats.coverage * 1000).toInt() / 10f}% lit=${stats.lit}/${stats.total} " +
-                "faces=${stats.doneCount}/8 cam=${stats.camSector} target=${if (stats.hasTarget) 1 else 0} " +
+                "faces=${stats.doneCount}/8 cam=${stats.camSector} target=${stats.targetSector} " +
+                "dwell=${(stats.camFaceProgress * 100).toInt()}% " +
                 "fps=${stats.fps} drawMs=${stats.drawMs} " +
                 "rPx=${stats.sphereRadiusPx.toInt()} cy=${stats.sphereCenterYPx.toInt()} " +
                 "next=(${fmt(stats.nextX)},${fmt(stats.nextY)}) src=${currentSourceLabel()}"
@@ -244,5 +269,19 @@ class MainActivity : ComponentActivity(), HudView.Listener {
 
     override fun onDrag(dx: Float, dy: Float) {
         orientationTracker.onDrag(dx, dy)
+    }
+
+    override fun onOnboardingFinished() {
+        onboardingActive = false
+        prefs.edit().putBoolean(KEY_ONBOARDING_DONE, true).apply()
+        glView.renderer.autoCapture = true
+        pushHudState()
+    }
+
+    private val prefs by lazy { getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
+
+    private companion object {
+        const val PREFS_NAME = "guidesphere"
+        const val KEY_ONBOARDING_DONE = "onboarding_done"
     }
 }

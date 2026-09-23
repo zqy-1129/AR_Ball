@@ -57,16 +57,22 @@ class ScanSession(private val dirs: FloatArray) {
     var coverage: Float = 0f
         private set
 
-    /** 当前正对的那个面里还剩几个点没点亮（供 HUD / logcat 观测） */
-    var inFrameUnlit: Int = 0
-        private set
-
     /** 最近一次拍摄新增了多少个光点（= 一个面的点数，供「已捕获 +N」提示） */
     var lastBatch: Int = 0
         private set
 
     /** 批次提示的衰减量 0..1 */
     var batchFlash: Float = 0f
+        private set
+
+    /**
+     * 「镜头正对的那个面已经对准多久」0..1。
+     *
+     * 自动采样是「对准就拍」，但用户在屏幕上完全看不见这件事正在发生 ——
+     * 这里把停留计时暴露出去，HUD 才能在进度环上画出一段正在填满的小弧，
+     * 让「还差一点点」变得可见、可预期。
+     */
+    var camFaceProgress: Float = 0f
         private set
 
     // ------------------------------------------------------------ 方位扇区
@@ -168,9 +174,9 @@ class ScanSession(private val dirs: FloatArray) {
         hintAmount.fill(0f)
         litCount = 0
         coverage = 0f
-        inFrameUnlit = 0
         lastBatch = 0
         batchFlash = 0f
+        camFaceProgress = 0f
         sectorProgress.fill(0f)
         sectorComplete.fill(false)
         sectorLitCount.fill(0)
@@ -250,7 +256,13 @@ class ScanSession(private val dirs: FloatArray) {
             batchFlash = 1f
         }
         coverage = if (count == 0) 0f else litCount.toFloat() / count
-        inFrameUnlit = sectorDotCount[camSector] - sectorLitCount[camSector]
+        // 「对准即拍」的对准进度：只有自动采样 + 当前面还没拍完时才有意义。
+        // 手动快门模式下恒为 0，HUD 也据此不画那段小弧。
+        camFaceProgress = if (autoCapture && !sectorComplete[camSector]) {
+            (sectorDwell[camSector] / FACE_DWELL_SECONDS).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
 
         // ---- 完成确认（带延迟，抵消边界点闪烁导致的状态抖动） ----
         var done = 0
